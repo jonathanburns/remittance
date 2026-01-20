@@ -1,108 +1,128 @@
-## Code Sample:
+## Gasless USDC Remittance Transfer
 
-The following code is for demo purposes only. It shows how you can facilitate gasless USDC transfers for a remittance app built on Solana.
+This codebase is a sample implementation for gasless USDC transfers, which is useful for powering a remittance app built on Solana.
 
-The client has a “transfer” function that will:
+For the purposes of the demo:
 
-- Create instructions for an idempotent ATA creation + a transfer instruction, sign the transaction, and send it to the relayer. The relayer returns the tx_id.
-- Poll a “status” endpoint which the relayer provides, passing in the transaction hash.
-- Log “success” or “failure” when the transaction reaches a terminal state.
+- There is no database (all state is stored in-mem)
+- The relayer "API" is just a function call.
+- Functions to perform due diligence and send receipts are mocked out.
 
-For demo purposes, the relayer is simply a function in the file. In a real deployment, this would be an API call. The relayTransaction function will:
+The app has a few components.
 
-- Perform a variety of checks to ensure that the transaction is well formed.
-- Signs the transaction with the relayer’s signature, and stores a record of this transaction in the db.
-- Returns “success”
+### The Client
 
-For demo purposes, the database is an in-memory JSON object.
-
-There is an asynchronous workflow that runs once per second. It:
-
-- Gathers all transactions that are not in terminal state. For each transaction, it:
-  - Submits the transaction if necessary.
-  - Updates the transaction status to reflect the on-chain status.
-  - Updates the status to FAILED only if we are 100% sure it has failed. (this is important because a user might re-try a failed transaction)
-
-Lastly, there is a function (which would normally be an API) which surfaces the transaction status.  
-In a real scenario, you might want to gate this endpoint so that only the sending user can call it.
-
----
-
-## Details:
-
-The client has a private key. It has a “send transaction” function that takes, as input, the recipient, and USDC amount. It:
+It has a "transfer" function which takes, as input, the recipient address, and a USDC amount. It:
 
 - Generates a transaction with two instructions
-- Idempotent create of the recipient ATA (associated token account)
-- The transfer instruction between the two ATAs
-- Include the known gas-relayer address as the fee payer.
-- Signs the transaction and sends it to the relayer. It includes the lastValidBlockheight in this call.
-- Once it receives a “success” from the relayer, it kicks off an async function which periodically calls “get_status” endpoint from the relayer every 5 seconds, passing in the transaction_hash.
-- If the response status CONFIRMED or FINALIZED, it prints “transaction succeeded!”, and quits the loop.
+  - Idempotent creation of the recipient ATA (associated token account)
+  - The transfer instruction between the two ATAs
+- Sets the fee payer to the known relayer address.
+- Signs the transaction and sends it to the relayTransaction API, along with the lastValidBlockHeight.
+- When the relayer responds with the transactionId, it kicks off the pollTransactionStatus loop.
 
-The server “send transaction” endpoint:
+The "pollTransactionStatus" loop:
 
-For the purposes of the demo, the DB will just be an in-mem datastore.
+- periodically polls the relayer's getTransactionStatus API.
+- updates the local state to reflect changes. We consider the CONFIRMED status success (which provides the user with quick feedback). For the purposes of the demo, it just logs.
 
-Perform pre-checks:
+### The Relayer
 
-- Check that there are exactly two instructions.
-- Fee payer == relayer pubkey (and required signer)
-- Transaction has a recent blockhash
-- No extra writable/signers beyond what we expect (prevents sneaky instruction combos)
+The relayer has two APIs.
 
-Second instruction:
+The "relayTransaction" API:
 
-- Verify sender and recipient are both accounts in our internal db [we’ll hard code this for the demo]
-- Send sender/recipient address “is_compliant” function, which just returns true in the demo.
-- Must be SPL token TransferChecked
-- Source ATA owner == sender (or delegated authority if you support that; otherwise reject)
-- Destination ATA matches recipient’s ATA
-- Verify the token is USDC
+- Performs a number of checks on the submitted transaction
+  - ensures that there are two instructions in the transaction.
+  - ensures the fee payer is correct.
+  - ensures transaction has a recent blockhash
+  - ensures no unexpected signers
+  - for the second instruction:
+    - ensures it is a TransferChecked instruction
+    - ensures both sender and recipient are accounts in our DB (to protect us from gas freeloaders)
+    - calls isCompliant on both sender and recipient to perform due diligence
+    - ensures source ATA owner is sender
+    - ensures destination ATA owner is recipient
+    - ensures token is USDC
+  - for the first instruction:
+    - ensures it is a Token Account Create Idempotent instruction
+    - ensures the target is the recipient ATA for USDC
+  - ensures sender signature present
+- Stores the transaction (keyed by transactionHash), if it is not already stored in the DB.
+  - sets status = CREATED
+  - includes lastValidBlockHeight
+- returns the transactionId (transactionHash)
 
-First instruction:
+The "getTransactionStatus" API:
 
-- Must be Associated Token Account Program create idempotent
-- Must target the recipient ATA for USDC
+- Looks up the transaction in the DB, and returns the status.
 
-Signatures:
+### Status Update Workflow:
 
-- Ensure the sender signature is present
-- Ensure relayer signature is not present yet
-- Sign the transaction
-- If the transaction doesn’t already exist in the DB, store it, keyed by the transaction signature.
-- Status should be “created”, and include lastValidBlockheight
-- Return transaction_id
+This component periodically gets all non-terminal transactions (transactions that are not in FINALIZED or FAILED state). For each one, it:
 
----
-
-## Workflow Loop:
-
-Get all transactions in NOT in FINALIZED or FAILED state. For each:
-
-- tx getSignatureStatuses
-  - If null
-    - If isBlockhashValid (i.e. can we submit/re-submit it?)
-      - Broadcast the tx on-chain
-      - If statue == CREATED
-        - Set STATE = SUBMITTED
+- calls getSignatureStatuses
+  - if this returns null:
+    - if isBlockhashValid (i.e. we can re-submit the transaction)
+      - broadcast the transaction on-chain
+      - if state is CREATED
+        - update state to SUBMITTED
   - else:
-    - // confirm that the transaction is not included on-chain
-    - getEpochInfo({ commitment: "finalized" }) // tells us the most recent finalized block
-    - if getEpochInfo.blockHeight < lastValidBlockheight
-      - return
-    - getSignatureStatuses (with history = true)
-      - If not null, return
-    - Call getTransaction (of any commitment)
-      - If not null, return
-    - Set state = FAILED
-    - Return
+    - confirms the transaction has failed before setting status.
+      - calls getEpochInfo({ commitment: "finalized" }) // get the most recently finalized block
+        - if getEpochInfo.blockHeight < lastValidBlockHeight, returns
+      - calls getSignatureStatuses (with searchTransactionHistory = true)
+        - If response is not null, returns
+      - calls getTransaction
+        - If response is not null, returns
+      - sets state = FAILED
+      - returns
 
-- Get confirmationStatus
+- gets confirmationStatus from transaction
   - If status == “processed”
     - Set state = PROCESSED
   - If status == “confirmed”
     - Set state = CONFIRMED
   - If status == “finalized”
-    - Call sendReceipt function (just logs for now)
+    - Call sendReceipt function
     - Set state = FINALIZED
+
+## How To Run The Test
+
+1. Install dependencies (if not already done):
+
+   ```
+   npm install
+   ```
+
+2. create a keypairs.json in the root of this repo with 3 keypairs:
+
+   ```
+   "sender": key
+   "recipient": key
+   relayer: key
+   ```
+
+3. Run the demo:
+
+   ```
+   npm start
+   ```
+
+4. Fund the accounts when prompted:
+
+- Relayer - needs ~0.01 SOL for gas fees
+- Sender - needs devnet USDC to transfer
+
+Once funded, the demo will automatically:
+
+- Create a gasless USDC transfer (half of sender's balance)
+- Submit it via the relayer
+- Poll until finalized
+- Print a receipt
+
+## Sequence Diagram
+
+Here is a simplified diagram showing the flow:
+
+![Mermaid diagram](assets/mermaid.png)
